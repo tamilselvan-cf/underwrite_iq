@@ -1,0 +1,527 @@
+import path from "path";
+import fs from "fs/promises";
+import crypto from "crypto";
+import OpenAI from "openai";
+
+const MAX_PAGES_PER_BATCH = 3;
+
+const SYSTEM_PROMPT = `You are a form structure analyzer. Analyze the provided form image(s) and extract the complete structure.
+
+TASK: Identify all form fields and classify them into these component types ONLY:
+- Signature: Signature lines or boxes
+- Multi-Select: Checkboxes (multiple can be selected)
+- File Upload: File/document attachment areas
+- Short Input: Single-line text fields
+- Sections: Section dividers or headers within the form
+- Dropdown: Select/dropdown menus
+- Radio Select: Radio buttons (single selection)
+- Table: Tabular data entry with columns and rows
+- Title: Bold text, headings that introduce/group fields
+- Long Input: Multi-line text areas
+
+DOCUMENT STRUCTURE - FLAT (NO SUBSECTIONS):
+1. **SECTIONS**: Major sections with headers (highlighted/shaded backgrounds like "III. COVERAGE", "IV. EXPOSURES")
+2. **FIELDS**: All items within a section are FIELDS (including titles like "HOSPITALS", "Self-Insured Retention (SIR):")
+
+CRITICAL RULES:
+1. **PRESERVE EXACT TEXT**: Copy all labels and titles EXACTLY as they appear in the document.
+2. **EXCLUDE SERIAL NUMBERS**: Remove leading numbering/lettering from labels (A., B., 1., 2., I., II., etc.)
+3. **SKIP INSTRUCTION TEXT**: Do NOT include instruction paragraphs. Only capture actual INPUT FIELDS.
+4. **BOLD TEXT = Title component**: Bold/emphasized text that labels a group should be a Title component
+5. Extract ALL visible options for Multi-Select, Radio Select, and Dropdown
+6. For Table: extract column headers and COUNT the rows (rowCount)
+7. Mark fields as required if they show asterisks (*) or "required"
+8. Maintain top-to-bottom, left-to-right ordering
+9. **ONLY INPUT FIELDS**: Only capture fields that have actual input areas.
+
+RESPOND WITH ONLY VALID JSON in this exact format:
+{
+  "formTitle": "Form Title Here",
+  "sections": [
+    {
+      "id": "section_1",
+      "title": "COVERAGE",
+      "order": 1,
+      "fields": [
+        {
+          "id": "field_1",
+          "component": "Radio Select",
+          "label": "Does the applicant want to change the current insurance structure:",
+          "required": false,
+          "order": 1,
+          "options": ["Yes", "No"]
+        }
+      ]
+    }
+  ]
+}
+
+FIELD PROPERTIES:
+- For Multi-Select, Radio Select, Dropdown: add "options": ["Option 1", "Option 2"]
+- For Table: add "columns" (header row) and "rowCount" (number of rows)
+- For Title: just include the "label" with the title/heading text`;
+
+// ============== Types ==============
+
+interface ImageData {
+  page: number;
+  base64: string;
+  mimeType: string;
+}
+
+interface ExtractedField {
+  id: string;
+  component: string;
+  componentId: string | null;
+  label: string;
+  required: boolean;
+  order: number;
+  options?: string[];
+  columns?: string[];
+  rowCount?: number;
+}
+
+// Component name to ID mapping built from database
+type ComponentIdMap = Map<string, string>;
+
+interface ExtractedSection {
+  id: string;
+  title: string;
+  order: number;
+  fields: ExtractedField[];
+}
+
+export interface ExtractionResult {
+  formTitle: string;
+  sections: ExtractedSection[];
+}
+
+export interface ComponentCatalogEntry {
+  id: string;
+  name: string | null;
+  iconUrl: string | null;
+}
+
+export interface MappedSection {
+  id: string;
+  orderNo: number;
+  componentId: string | null;
+  componentName: string | null;
+  componentIconUrl: string | null;
+  name: string | null; // User-editable section name from extraction
+}
+
+export interface MappedComponent {
+  id: string;
+  order: number;
+  pageFormComponentId: string | null;
+  componentId: string | null;
+  componentName: string | null;
+  componentIconUrl: string | null;
+  fieldLabel: string | null;
+  fieldPlaceholder: string | null;
+  fieldsOptions: string[] | null;
+  requiredField: boolean;
+  helpText: string | null;
+  validation: string | null;
+  integration: string | null;
+  textSizeId: string | null;
+  fontWeightId: string | null;
+  description: string | null;
+  tableColumns: string[] | null;
+  tableRows: number | null;
+  isVisible: boolean;
+}
+
+export interface MappedExtractionResult {
+  sections: MappedSection[];
+  components: MappedComponent[];
+  formTitle: string;
+}
+
+// ============== Utility Functions ==============
+
+function extractJsonFromText(text: string): string {
+  const jsonBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonBlockMatch) return jsonBlockMatch[1].trim();
+  const jsonObjectMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonObjectMatch) return jsonObjectMatch[0];
+  return text;
+}
+
+function safeJsonParse(str: string): { success: true; data: any } | { success: false; error: string } {
+  try {
+    return { success: true, data: JSON.parse(str) };
+  } catch (error: any) {
+    return { success: false, error: error.message };
+  }
+}
+
+function getFileExtension(fileName: string): string {
+  return path.extname(fileName).toLowerCase().slice(1);
+}
+
+// ============== File Processing ==============
+
+async function convertPdfToImages(buffer: Buffer): Promise<ImageData[]> {
+  const { exec } = await import("child_process");
+  const { promisify } = await import("util");
+  const execAsync = promisify(exec);
+
+  // Validate PDF header
+  const pdfHeader = buffer.slice(0, 5).toString("ascii");
+  if (pdfHeader !== "%PDF-") {
+    console.error("[FormExtraction] Invalid PDF header:", pdfHeader, "Buffer starts with:", buffer.slice(0, 20).toString("hex"));
+    throw new Error("The uploaded file is not a valid PDF. Please upload a proper PDF document.");
+  }
+
+  const sessionId = crypto.randomUUID();
+  const tmpDir = path.join("/tmp", `form-extract-${sessionId}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  const pdfPath = path.join(tmpDir, "input.pdf");
+  const outputPrefix = path.join(tmpDir, "page");
+
+  // Write buffer directly without any encoding conversion
+  await fs.writeFile(pdfPath, buffer);
+
+  // Verify the file was written correctly
+  const writtenSize = (await fs.stat(pdfPath)).size;
+  console.log(`[FormExtraction] PDF written: ${writtenSize} bytes (original: ${buffer.length} bytes)`);
+
+  try {
+    // Use pdftoppm directly (from poppler-utils)
+    try {
+      await execAsync(`pdftoppm -png "${pdfPath}" "${outputPrefix}"`);
+    } catch (execError: any) {
+      // pdftoppm may exit with non-zero even on warnings, check if images were created
+      console.log("[FormExtraction] pdftoppm output:", execError.stderr || execError.stdout || execError.message);
+    }
+
+    const files = await fs.readdir(tmpDir);
+    const imageFiles = files
+      .filter((f) => f.startsWith("page") && f.endsWith(".png"))
+      .sort((a, b) => {
+        // Handle both page-1.png and page-01.png formats
+        const numA = parseInt(a.match(/-(\d+)\.png$/)?.[1] || "0");
+        const numB = parseInt(b.match(/-(\d+)\.png$/)?.[1] || "0");
+        return numA - numB;
+      });
+
+    if (imageFiles.length === 0) {
+      throw new Error("Failed to convert PDF to images. The PDF may be corrupted or password-protected.");
+    }
+
+    console.log(`[FormExtraction] Converted PDF to ${imageFiles.length} image(s)`);
+
+    const images: ImageData[] = [];
+    for (let i = 0; i < imageFiles.length; i++) {
+      const imagePath = path.join(tmpDir, imageFiles[i]);
+      const fileBuffer = await fs.readFile(imagePath);
+      images.push({
+        page: i + 1,
+        base64: fileBuffer.toString("base64"),
+        mimeType: "image/png",
+      });
+    }
+    return images;
+  } catch (error: any) {
+    console.error("[FormExtraction] PDF conversion error:", error.message);
+    if (error.message.includes("Syntax Error") || error.message.includes("trailer")) {
+      throw new Error("The PDF file appears to be corrupted or invalid. Please try uploading a different file.");
+    }
+    throw error;
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function processImageBuffer(buffer: Buffer): Promise<ImageData[]> {
+  const sharp = (await import("sharp")).default;
+
+  const processed = await sharp(buffer)
+    .png({ quality: 90 })
+    .resize({ width: 2000, height: 2000, fit: "inside", withoutEnlargement: true })
+    .toBuffer();
+
+  return [{ page: 1, base64: processed.toString("base64"), mimeType: "image/png" }];
+}
+
+async function processFileBuffer(buffer: Buffer, fileName: string): Promise<ImageData[]> {
+  const extension = getFileExtension(fileName);
+
+  if (extension === "pdf") {
+    return convertPdfToImages(buffer);
+  } else if (["jpg", "jpeg", "png"].includes(extension)) {
+    return processImageBuffer(buffer);
+  } else {
+    throw new Error(`Unsupported file type: ${extension}. Use PDF, JPG, or PNG.`);
+  }
+}
+
+// ============== OpenAI Processing ==============
+
+function normalizeComponentType(type: string | undefined): string {
+  if (!type) return "Short Input";
+  const typeMap: Record<string, string> = {
+    signature: "Signature",
+    "multi-select": "Multi-Select",
+    multiselect: "Multi-Select",
+    checkbox: "Multi-Select",
+    "file upload": "File Upload",
+    fileupload: "File Upload",
+    "short input": "Short Input",
+    shortinput: "Short Input",
+    text: "Short Input",
+    sections: "Sections",
+    section: "Sections",
+    dropdown: "Dropdown",
+    select: "Dropdown",
+    "radio select": "Radio Select",
+    radioselect: "Radio Select",
+    radio: "Radio Select",
+    table: "Table",
+    title: "Title",
+    heading: "Title",
+    "long input": "Long Input",
+    longinput: "Long Input",
+    textarea: "Long Input",
+  };
+  return typeMap[type.toLowerCase()] || type;
+}
+
+function normalizeFormStructure(data: any, componentIdMap: ComponentIdMap): ExtractionResult {
+  const formTitle = data.formTitle || "Untitled Form";
+  const sections: ExtractedSection[] = (data.sections || []).map(
+    (section: any, sectionIndex: number) => ({
+      id: section.id || `section_${sectionIndex + 1}`,
+      title: section.title || `Section ${sectionIndex + 1}`,
+      order: section.order || sectionIndex + 1,
+      fields: (section.fields || []).map((field: any, fieldIndex: number) => {
+        const componentName = normalizeComponentType(field.component || field.type);
+        const normalized: ExtractedField = {
+          id: field.id || `field_${fieldIndex + 1}`,
+          component: componentName,
+          componentId: componentIdMap.get(componentName.toLowerCase()) || null,
+          label: field.label || `Field ${fieldIndex + 1}`,
+          required: Boolean(field.required),
+          order: field.order || fieldIndex + 1,
+        };
+        if (["Multi-Select", "Radio Select", "Dropdown"].includes(normalized.component)) {
+          normalized.options = field.options || [];
+        }
+        if (normalized.component === "Table") {
+          normalized.columns = field.columns || [];
+          normalized.rowCount = field.rowCount || 0;
+        }
+        return normalized;
+      }),
+    })
+  );
+  return { formTitle, sections };
+}
+
+async function processImageBatch(
+  openai: OpenAI,
+  images: ImageData[],
+  startPage: number,
+  totalPages: number,
+  componentIdMap: ComponentIdMap
+): Promise<ExtractionResult> {
+  const content: OpenAI.ChatCompletionContentPart[] = [
+    {
+      type: "text",
+      text:
+        totalPages > images.length
+          ? `Analyze pages ${startPage} to ${startPage + images.length - 1} of ${totalPages} of this form.`
+          : "Analyze this form and extract its complete structure.",
+    },
+  ];
+
+  for (const img of images) {
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:${img.mimeType};base64,${img.base64}`, detail: "high" },
+    });
+  }
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content },
+    ],
+    max_tokens: 4096,
+    temperature: 0.1,
+  });
+
+  const responseContent = response.choices[0]?.message?.content;
+  if (!responseContent) throw new Error("Empty response from GPT-4o");
+
+  if (
+    responseContent.toLowerCase().includes("i'm sorry") ||
+    responseContent.toLowerCase().includes("i cannot")
+  ) {
+    throw new Error("The AI could not process this document.");
+  }
+
+  const jsonString = extractJsonFromText(responseContent);
+  const parseResult = safeJsonParse(jsonString);
+
+  if (!parseResult.success) {
+    console.error("[FormExtraction] Failed to parse response:", responseContent);
+    throw new Error("Invalid JSON response from AI.");
+  }
+
+  return normalizeFormStructure(parseResult.data, componentIdMap);
+}
+
+async function extractFormStructure(
+  openai: OpenAI,
+  images: ImageData[],
+  componentIdMap: ComponentIdMap
+): Promise<ExtractionResult> {
+  if (!images || images.length === 0) throw new Error("No images provided");
+
+  if (images.length <= MAX_PAGES_PER_BATCH) {
+    return processImageBatch(openai, images, 1, images.length, componentIdMap);
+  }
+
+  console.log(`[FormExtraction] Processing ${images.length} pages in batches...`);
+  const batchResults: ExtractionResult[] = [];
+
+  for (let i = 0; i < images.length; i += MAX_PAGES_PER_BATCH) {
+    const batch = images.slice(i, i + MAX_PAGES_PER_BATCH);
+    console.log(
+      `[FormExtraction] Processing pages ${i + 1}-${Math.min(i + MAX_PAGES_PER_BATCH, images.length)}...`
+    );
+    batchResults.push(await processImageBatch(openai, batch, i + 1, images.length, componentIdMap));
+  }
+
+  const formTitle = batchResults[0].formTitle;
+  let sectionOrder = 0;
+  const allSections: ExtractedSection[] = [];
+
+  for (const result of batchResults) {
+    for (const section of result.sections) {
+      sectionOrder++;
+      allSections.push({
+        ...section,
+        id: `section_${sectionOrder}`,
+        order: sectionOrder,
+        fields: section.fields.map((field, idx) => ({
+          ...field,
+          id: `field_${sectionOrder}_${idx + 1}`,
+        })),
+      });
+    }
+  }
+
+  return { formTitle, sections: allSections };
+}
+
+// ============== Main Entry Point ==============
+
+/**
+ * Build a component ID map from the database catalog
+ * Maps lowercase component names to their UUIDs
+ */
+function buildComponentIdMap(componentCatalog: ComponentCatalogEntry[]): ComponentIdMap {
+  const map = new Map<string, string>();
+  for (const entry of componentCatalog) {
+    if (entry.name && entry.id) {
+      map.set(entry.name.toLowerCase(), entry.id);
+    }
+  }
+  return map;
+}
+
+export async function extractFormFromBuffer(
+  buffer: Buffer,
+  fileName: string,
+  componentCatalog: ComponentCatalogEntry[]
+): Promise<ExtractionResult> {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is not configured");
+  }
+
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const images = await processFileBuffer(buffer, fileName);
+  const componentIdMap = buildComponentIdMap(componentCatalog);
+
+  console.log(`[FormExtraction] Converted ${fileName} to ${images.length} image(s), sending to GPT-4o...`);
+  console.log(`[FormExtraction] Loaded ${componentIdMap.size} component IDs from database`);
+
+  return extractFormStructure(openai, images, componentIdMap);
+}
+
+// ============== Mapping to Builder Format ==============
+
+export function mapToBuilderFormat(
+  extraction: ExtractionResult,
+  componentCatalog: ComponentCatalogEntry[]
+): MappedExtractionResult {
+  // Build case-insensitive name lookup map
+  const catalogMap = new Map<string, ComponentCatalogEntry>();
+  for (const entry of componentCatalog) {
+    if (entry.name) {
+      catalogMap.set(entry.name.toLowerCase(), entry);
+    }
+  }
+
+  const sectionsEntry = catalogMap.get("sections");
+  const fallbackEntry = catalogMap.get("short input");
+
+  const mappedSections: MappedSection[] = [];
+  const mappedComponents: MappedComponent[] = [];
+
+  for (const section of extraction.sections) {
+    const sectionTempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    mappedSections.push({
+      id: sectionTempId,
+      orderNo: section.order,
+      componentId: sectionsEntry?.id || null,
+      componentName: sectionsEntry?.name || "Sections",
+      componentIconUrl: sectionsEntry?.iconUrl || null,
+      name: section.title || null, // Use extracted section title as the editable name
+    });
+
+    for (const field of section.fields) {
+      const normalizedType = normalizeComponentType(field.component);
+      const catalogEntry = catalogMap.get(normalizedType.toLowerCase()) || fallbackEntry;
+
+      const componentTempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+      const mapped: MappedComponent = {
+        id: componentTempId,
+        order: field.order,
+        pageFormComponentId: sectionTempId,
+        componentId: catalogEntry?.id || null,
+        componentName: catalogEntry?.name || normalizedType,
+        componentIconUrl: catalogEntry?.iconUrl || null,
+        fieldLabel: field.label,
+        fieldPlaceholder: null,
+        fieldsOptions: field.options || null,
+        requiredField: field.required,
+        helpText: null,
+        validation: null,
+        integration: null,
+        textSizeId: null,
+        fontWeightId: null,
+        description: null,
+        tableColumns: field.columns || null,
+        tableRows: field.rowCount ?? null,
+        isVisible: true,
+      };
+
+      mappedComponents.push(mapped);
+    }
+  }
+
+  return {
+    sections: mappedSections,
+    components: mappedComponents,
+    formTitle: extraction.formTitle,
+  };
+}
